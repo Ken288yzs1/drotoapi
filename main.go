@@ -7,8 +7,11 @@ import (
     "io"
     "log"
     "net/http"
+    "net/url"
     "os"
     "strings"
+
+    "golang.org/x/net/proxy"
 )
 
 var (
@@ -16,6 +19,7 @@ var (
     ANTHROPIC_TARGET = getEnv("ANTHROPIC_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
     OPENAI_TARGET    = getEnv("OPENAI_TARGET_URL", "https://app.factory.ai/api/llm/o/v1/responses")
     BEDROCK_TARGET   = getEnv("BEDROCK_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
+    SOCKS5_PROXY     = getEnv("SOCKS5_PROXY", "") // 新增：SOCKS5 代理地址
 )
 
 func getEnv(key, defaultValue string) string {
@@ -32,6 +36,10 @@ func main() {
     log.Println("➡️  Anthropic 请求转发到:", ANTHROPIC_TARGET)
     log.Println("➡️  OpenAI 请求转发到:", OPENAI_TARGET)
     log.Println("➡️  Bedrock 请求转发到:", BEDROCK_TARGET)
+
+    if SOCKS5_PROXY != "" {
+        log.Println("🔐 使用 SOCKS5 代理:", SOCKS5_PROXY)
+    }
 
     if err := http.ListenAndServe(":"+PROXY_PORT, nil); err != nil {
         log.Fatal("服务器启动失败:", err)
@@ -244,12 +252,52 @@ func copyHeaders(src *http.Request, dst *http.Request) {
     }
 }
 
-func forwardRequest(w http.ResponseWriter, proxyReq *http.Request) {
+// 创建 HTTP Client（支持 SOCKS5 代理）
+func createHTTPClient() *http.Client {
     client := &http.Client{
         CheckRedirect: func(req *http.Request, via []*http.Request) error {
             return http.ErrUseLastResponse
         },
     }
+
+    // 如果配置了 SOCKS5 代理
+    if SOCKS5_PROXY != "" {
+        proxyURL, err := url.Parse(SOCKS5_PROXY)
+        if err != nil {
+            log.Printf("[Proxy] ⚠️  SOCKS5 代理地址解析失败: %v，将不使用代理", err)
+            return client
+        }
+
+        // 支持带认证的 SOCKS5
+        var auth *proxy.Auth
+        if proxyURL.User != nil {
+            password, _ := proxyURL.User.Password()
+            auth = &proxy.Auth{
+                User:     proxyURL.User.Username(),
+                Password: password,
+            }
+        }
+
+        // 创建 SOCKS5 dialer
+        dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+        if err != nil {
+            log.Printf("[Proxy] ⚠️  SOCKS5 代理创建失败: %v，将不使用代理", err)
+            return client
+        }
+
+        // 设置 Transport 使用 SOCKS5
+        client.Transport = &http.Transport{
+            Dial: dialer.Dial,
+        }
+
+        log.Printf("[Proxy] ✅ SOCKS5 代理已启用: %s", proxyURL.Host)
+    }
+
+    return client
+}
+
+func forwardRequest(w http.ResponseWriter, proxyReq *http.Request) {
+    client := createHTTPClient() // 使用支持 SOCKS5 的 client
 
     resp, err := client.Do(proxyReq)
     if err != nil {
