@@ -1,0 +1,73 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_dispatch:  # 仅手动触发
+    inputs:
+      version:
+        description: '镜像版本标签 (例如 latest, v1.0.0, test)'
+        required: true
+        type: string
+        default: 'latest'
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/drotoapi
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Test Go Build
+        run: |
+          go mod init drotoapi 2>/dev/null || true
+          go mod tidy
+          go build -o /tmp/test-build main.go
+          rm /tmp/test-build
+          echo "✅ Go 代码编译测试成功"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ inputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Summary
+        run: |
+          echo "### 🎉 Docker 镜像构建成功！" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像标签:** \`${{ env.IMAGE_NAME }}:${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**拉取命令:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo <q>"docker pull ${{ env.IMAGE_NAME }}:${{ inputs.version }}"</q> >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**运行命令:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo <q>"docker run -d --name drotoapi -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ inputs.version }}"</q> >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
