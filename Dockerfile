@@ -14,12 +14,13 @@ RUN go mod download && \
 # 第二阶段：运行
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates tzdata
-
 WORKDIR /root/
 
+# 从构建阶段复制二进制文件
 COPY --from=builder /app/drotoapi .
 
+# 暴露端口
 EXPOSE 8000
 
+# 运行
 CMD ["./drotoapi"]
