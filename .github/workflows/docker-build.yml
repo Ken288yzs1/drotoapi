@@ -27,8 +27,7 @@ jobs:
 
       - name: Test Go Build
         run: |
-          go mod init drotoapi 2>/dev/null || true
-          go mod tidy
+          go mod download
           go build -o /tmp/test-build main.go
           rm /tmp/test-build
           echo "✅ Go 代码编译测试成功"
@@ -68,8 +67,13 @@ jobs:
           docker pull ${{ env.IMAGE_NAME }}:${{ inputs.version }}
           ```
 
-          **运行命令:**
+          **运行命令（不使用代理）:**
           ```bash
           docker run -d --name drotoapi -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ inputs.version }}
+          ```
+
+          **运行命令（使用 SOCKS5 代理）:**
+          ```bash
+          docker run -d --name drotoapi -p 8000:8000 -e SOCKS5_PROXY=socks5://127.0.0.1:1080 ${{ env.IMAGE_NAME }}:${{ inputs.version }}
           ```
           EOF
