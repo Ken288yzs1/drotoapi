@@ -1,7 +1,7 @@
 name: Build and Push Docker Image
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
     inputs:
       version:
         description: '镜像版本标签 (例如 latest, v1.0.0, test)'
@@ -58,16 +58,18 @@ jobs:
 
       - name: Build Summary
         run: |
-          echo "### 🎉 Docker 镜像构建成功！" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**镜像标签:** \`${{ env.IMAGE_NAME }}:${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**拉取命令:**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo <q>"docker pull ${{ env.IMAGE_NAME }}:${{ inputs.version }}"</q> >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**运行命令:**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo <q>"docker run -d --name drotoapi -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ inputs.version }}"</q> >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ### 🎉 Docker 镜像构建成功！
+
+          **镜像标签:** `${{ env.IMAGE_NAME }}:${{ inputs.version }}`
+
+          **拉取命令:**
+          ```bash
+          docker pull ${{ env.IMAGE_NAME }}:${{ inputs.version }}
+          ```
+
+          **运行命令:**
+          ```bash
+          docker run -d --name drotoapi -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ inputs.version }}
+          ```
+          EOF
