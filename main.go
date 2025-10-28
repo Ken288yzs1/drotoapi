@@ -10,6 +10,7 @@ import (
     "net/url"
     "os"
     "strings"
+    "sync"
 
     "golang.org/x/net/proxy"
 )
@@ -19,7 +20,10 @@ var (
     ANTHROPIC_TARGET = getEnv("ANTHROPIC_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
     OPENAI_TARGET    = getEnv("OPENAI_TARGET_URL", "https://app.factory.ai/api/llm/o/v1/responses")
     BEDROCK_TARGET   = getEnv("BEDROCK_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
-    SOCKS5_PROXY     = getEnv("SOCKS5_PROXY", "") // 新增：SOCKS5 代理地址
+    SOCKS5_PROXY     = getEnv("SOCKS5_PROXY", "")
+
+    httpClient     *http.Client
+    httpClientOnce sync.Once
 )
 
 func getEnv(key, defaultValue string) string {
@@ -29,17 +33,67 @@ func getEnv(key, defaultValue string) string {
     return defaultValue
 }
 
+// 初始化超高并发 HTTP Client
+func initHTTPClient() {
+    httpClientOnce.Do(func() {
+        // 创建超大并发 Transport
+        transport := &http.Transport{
+            MaxIdleConns:        100000, // 全局最大空闲连接：10万
+            MaxIdleConnsPerHost: 10000,  // 每个 host 最大空闲连接：1万
+            MaxConnsPerHost:     0,      // 每个 host 最大连接数：无限制
+        }
+
+        httpClient = &http.Client{
+            Transport: transport,
+            CheckRedirect: func(req *http.Request, via []*http.Request) error {
+                return http.ErrUseLastResponse
+            },
+        }
+
+        if SOCKS5_PROXY != "" {
+            log.Printf("[Proxy] 正在配置 SOCKS5 代理: %s", SOCKS5_PROXY)
+
+            proxyURL, err := url.Parse(SOCKS5_PROXY)
+            if err != nil {
+                log.Printf("[Proxy] ❌ SOCKS5 代理地址解析失败: %v，将使用直连", err)
+                return
+            }
+
+            var auth *proxy.Auth
+            if proxyURL.User != nil {
+                password, _ := proxyURL.User.Password()
+                auth = &proxy.Auth{
+                    User:     proxyURL.User.Username(),
+                    Password: password,
+                }
+            }
+
+            dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+            if err != nil {
+                log.Printf("[Proxy] ❌ SOCKS5 代理创建失败: %v，将使用直连", err)
+                return
+            }
+
+            transport.Dial = dialer.Dial
+
+            log.Printf("[Proxy] ✅ SOCKS5 代理已启用: %s", proxyURL.Host)
+        } else {
+            log.Println("[Proxy] 未配置 SOCKS5 代理，使用直连")
+        }
+
+        log.Printf("[Proxy] ✅ HTTP Client 已配置 - MaxIdleConns: 100000, MaxIdleConnsPerHost: 10000")
+    })
+}
+
 func main() {
+    initHTTPClient()
+
     http.HandleFunc("/", routeHandler)
 
     log.Println("🚀 代理服务器已启动，监听于 http://localhost:" + PROXY_PORT)
     log.Println("➡️  Anthropic 请求转发到:", ANTHROPIC_TARGET)
     log.Println("➡️  OpenAI 请求转发到:", OPENAI_TARGET)
     log.Println("➡️  Bedrock 请求转发到:", BEDROCK_TARGET)
-
-    if SOCKS5_PROXY != "" {
-        log.Println("🔐 使用 SOCKS5 代理:", SOCKS5_PROXY)
-    }
 
     if err := http.ListenAndServe(":"+PROXY_PORT, nil); err != nil {
         log.Fatal("服务器启动失败:", err)
@@ -252,54 +306,8 @@ func copyHeaders(src *http.Request, dst *http.Request) {
     }
 }
 
-// 创建 HTTP Client（支持 SOCKS5 代理）
-func createHTTPClient() *http.Client {
-    client := &http.Client{
-        CheckRedirect: func(req *http.Request, via []*http.Request) error {
-            return http.ErrUseLastResponse
-        },
-    }
-
-    // 如果配置了 SOCKS5 代理
-    if SOCKS5_PROXY != "" {
-        proxyURL, err := url.Parse(SOCKS5_PROXY)
-        if err != nil {
-            log.Printf("[Proxy] ⚠️  SOCKS5 代理地址解析失败: %v，将不使用代理", err)
-            return client
-        }
-
-        // 支持带认证的 SOCKS5
-        var auth *proxy.Auth
-        if proxyURL.User != nil {
-            password, _ := proxyURL.User.Password()
-            auth = &proxy.Auth{
-                User:     proxyURL.User.Username(),
-                Password: password,
-            }
-        }
-
-        // 创建 SOCKS5 dialer
-        dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
-        if err != nil {
-            log.Printf("[Proxy] ⚠️  SOCKS5 代理创建失败: %v，将不使用代理", err)
-            return client
-        }
-
-        // 设置 Transport 使用 SOCKS5
-        client.Transport = &http.Transport{
-            Dial: dialer.Dial,
-        }
-
-        log.Printf("[Proxy] ✅ SOCKS5 代理已启用: %s", proxyURL.Host)
-    }
-
-    return client
-}
-
 func forwardRequest(w http.ResponseWriter, proxyReq *http.Request) {
-    client := createHTTPClient() // 使用支持 SOCKS5 的 client
-
-    resp, err := client.Do(proxyReq)
+    resp, err := httpClient.Do(proxyReq)
     if err != nil {
         log.Printf("[Proxy] 转发请求失败: %v", err)
         jsonError(w, fmt.Sprintf("Bad Gateway: %v", err), http.StatusBadGateway)
