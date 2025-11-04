@@ -6,25 +6,39 @@ import (
     "fmt"
     "io"
     "log"
+    "math/rand"
     "net/http"
     "net/url"
     "os"
     "strings"
     "sync"
+    "time"
 
     "golang.org/x/net/proxy"
 )
 
+// 全局配置
 var (
-    PROXY_PORT       = getEnv("PROXY_PORT", "8000")
-    ANTHROPIC_TARGET = getEnv("ANTHROPIC_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
-    OPENAI_TARGET    = getEnv("OPENAI_TARGET_URL", "https://app.factory.ai/api/llm/o/v1/responses")
-    BEDROCK_TARGET   = getEnv("BEDROCK_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
-    SOCKS5_PROXY     = getEnv("SOCKS5_PROXY", "")
-
-    httpClient     *http.Client
-    httpClientOnce sync.Once
+    PROXY_PORT            = getEnv("PROXY_PORT", "8000")
+    ANTHROPIC_TARGET      = getEnv("ANTHROPIC_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
+    OPENAI_TARGET         = getEnv("OPENAI_TARGET_URL", "https://app.factory.ai/api/llm/o/v1/responses")
+    BEDROCK_TARGET        = getEnv("BEDROCK_TARGET_URL", "https://app.factory.ai/api/llm/a/v1/messages")
+    FACTORY_KEYS_RAW      = getEnv("FACTORY_KEYS", "")
+    SOCKS5_PROXY_TEMPLATE = getEnv("SOCKS5_PROXY_TEMPLATE", "")
 )
+
+// 全局状态
+type ProxyState struct {
+    batches         [][]string       // Key 分批
+    batchClients    [][]*http.Client // 每批对应的 HTTP Client
+    batchAvailable  [][]bool         // 每批 Key 的可用状态
+    currentBatchIdx int              // 当前使用的批次索引
+    currentKeyIdx   int              // 当前批次内的 Key 索引
+    mu              sync.RWMutex     // 并发控制锁
+    totalExhausted  bool             // 所有 Key 是否耗尽
+}
+
+var state *ProxyState
 
 func getEnv(key, defaultValue string) string {
     if value := os.Getenv(key); value != "" {
@@ -33,61 +47,221 @@ func getEnv(key, defaultValue string) string {
     return defaultValue
 }
 
-// 初始化超高并发 HTTP Client
-func initHTTPClient() {
-    httpClientOnce.Do(func() {
-        // 创建超大并发 Transport
-        transport := &http.Transport{
-            MaxIdleConns:        100000, // 全局最大空闲连接：10万
-            MaxIdleConnsPerHost: 10000,  // 每个 host 最大空闲连接：1万
-            MaxConnsPerHost:     0,      // 每个 host 最大连接数：无限制
+// 生成随机 8 位 sid
+func generateRandomSID() string {
+    rand.Seed(time.Now().UnixNano())
+    return fmt.Sprintf("%08d", rand.Intn(90000000)+10000000)
+}
+
+// 初始化 ProxyState
+func initProxyState() {
+    if FACTORY_KEYS_RAW == "" {
+        log.Fatal("❌ 环境变量 FACTORY_KEYS 未设置")
+    }
+
+    if SOCKS5_PROXY_TEMPLATE == "" {
+        log.Fatal("❌ 环境变量 SOCKS5_PROXY_TEMPLATE 未设置")
+    }
+
+    // 解析 Keys
+    keys := strings.Split(FACTORY_KEYS_RAW, ",")
+    for i := range keys {
+        keys[i] = strings.TrimSpace(keys[i])
+    }
+
+    if len(keys) == 0 {
+        log.Fatal("❌ FACTORY_KEYS 为空")
+    }
+
+    log.Printf("📊 加载了 %d 个 Factory Keys", len(keys))
+
+    // 分批（每批 5 个）
+    batchSize := 5
+    batches := [][]string{}
+    for i := 0; i < len(keys); i += batchSize {
+        end := i + batchSize
+        if end > len(keys) {
+            end = len(keys)
         }
+        batches = append(batches, keys[i:end])
+    }
 
-        httpClient = &http.Client{
-            Transport: transport,
-            CheckRedirect: func(req *http.Request, via []*http.Request) error {
-                return http.ErrUseLastResponse
-            },
-        }
+    log.Printf("📦 分为 %d 批", len(batches))
 
-        if SOCKS5_PROXY != "" {
-            log.Printf("[Proxy] 正在配置 SOCKS5 代理: %s", SOCKS5_PROXY)
+    // 为每批创建 HTTP Clients
+    batchClients := make([][]*http.Client, len(batches))
+    batchAvailable := make([][]bool, len(batches))
 
-            proxyURL, err := url.Parse(SOCKS5_PROXY)
+    for batchIdx, batch := range batches {
+        log.Printf("📦 批次 %d: %d 个 Keys", batchIdx, len(batch))
+
+        clients := make([]*http.Client, len(batch))
+        available := make([]bool, len(batch))
+
+        for keyIdx := range batch {
+            // 生成随机 sid
+            sid := generateRandomSID()
+
+            // 构建代理 URL
+            proxyURL := strings.Replace(SOCKS5_PROXY_TEMPLATE, "%s", sid, 1)
+
+            // 创建 HTTP Client
+            client, err := createHTTPClient(proxyURL)
             if err != nil {
-                log.Printf("[Proxy] ❌ SOCKS5 代理地址解析失败: %v，将使用直连", err)
-                return
+                log.Printf("⚠️  批次 %d, Key %d 创建 Client 失败: %v", batchIdx, keyIdx, err)
+                clients[keyIdx] = nil
+                available[keyIdx] = false
+            } else {
+                clients[keyIdx] = client
+                available[keyIdx] = true
+                log.Printf("   ✅ Key %d: sid_%s", keyIdx, sid)
             }
-
-            var auth *proxy.Auth
-            if proxyURL.User != nil {
-                password, _ := proxyURL.User.Password()
-                auth = &proxy.Auth{
-                    User:     proxyURL.User.Username(),
-                    Password: password,
-                }
-            }
-
-            dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
-            if err != nil {
-                log.Printf("[Proxy] ❌ SOCKS5 代理创建失败: %v，将使用直连", err)
-                return
-            }
-
-            transport.Dial = dialer.Dial
-
-            log.Printf("[Proxy] ✅ SOCKS5 代理已启用: %s", proxyURL.Host)
-        } else {
-            log.Println("[Proxy] 未配置 SOCKS5 代理，使用直连")
         }
 
-        log.Printf("[Proxy] ✅ HTTP Client 已配置 - MaxIdleConns: 100000, MaxIdleConnsPerHost: 10000")
-    })
+        batchClients[batchIdx] = clients
+        batchAvailable[batchIdx] = available
+    }
+
+    // 初始化全局状态
+    state = &ProxyState{
+        batches:         batches,
+        batchClients:    batchClients,
+        batchAvailable:  batchAvailable,
+        currentBatchIdx: 0,
+        currentKeyIdx:   0,
+        totalExhausted:  false,
+    }
+
+    log.Println("✅ ProxyState 初始化完成")
+}
+
+// 创建 HTTP Client（带 SOCKS5 代理）
+func createHTTPClient(proxyURL string) (*http.Client, error) {
+    parsedURL, err := url.Parse(proxyURL)
+    if err != nil {
+        return nil, fmt.Errorf("解析代理 URL 失败: %v", err)
+    }
+
+    // 创建 SOCKS5 dialer
+    var auth *proxy.Auth
+    if parsedURL.User != nil {
+        password, _ := parsedURL.User.Password()
+        auth = &proxy.Auth{
+            User:     parsedURL.User.Username(),
+            Password: password,
+        }
+    }
+
+    dialer, err := proxy.SOCKS5("tcp", parsedURL.Host, auth, proxy.Direct)
+    if err != nil {
+        return nil, fmt.Errorf("创建 SOCKS5 dialer 失败: %v", err)
+    }
+
+    // 创建 Transport
+    transport := &http.Transport{
+        Dial:                dialer.Dial,
+        MaxIdleConns:        500,
+        MaxIdleConnsPerHost: 100,
+        MaxConnsPerHost:     0,
+    }
+
+    // 创建 Client
+    client := &http.Client{
+        Transport: transport,
+        CheckRedirect: func(req *http.Request, via []*http.Request) error {
+            return http.ErrUseLastResponse
+        },
+    }
+
+    return client, nil
+}
+
+// 选择下一个可用的 Key
+func selectNextAvailableKey() (batchIdx int, keyIdx int, client *http.Client, factoryKey string) {
+    state.mu.Lock()
+    defer state.mu.Unlock()
+
+    // 检查是否完全耗尽
+    if state.totalExhausted {
+        return -1, -1, nil, ""
+    }
+
+    // 从当前批次开始查找
+    startBatchIdx := state.currentBatchIdx
+
+    for {
+        batch := state.batches[state.currentBatchIdx]
+        available := state.batchAvailable[state.currentBatchIdx]
+        clients := state.batchClients[state.currentBatchIdx]
+
+        // 在当前批次中查找可用 Key
+        found := false
+        startKeyIdx := state.currentKeyIdx
+
+        for i := 0; i < len(batch); i++ {
+            idx := (startKeyIdx + i) % len(batch)
+
+            if available[idx] {
+                // 找到可用 Key
+                state.currentKeyIdx = (idx + 1) % len(batch)
+
+                return state.currentBatchIdx, idx, clients[idx], batch[idx]
+            }
+        }
+
+        // 当前批次全部不可用，切换到下一批
+        if !found {
+            log.Printf("⚠️  批次 %d 全部耗尽，尝试切换到下一批", state.currentBatchIdx)
+
+            state.currentBatchIdx++
+            state.currentKeyIdx = 0
+
+            // 检查是否还有下一批
+            if state.currentBatchIdx >= len(state.batches) {
+                // 所有批次都耗尽
+                log.Println("❌ 所有 API Keys 已耗尽")
+                state.totalExhausted = true
+                return -1, -1, nil, ""
+            }
+
+            log.Printf("📦 切换到批次 %d", state.currentBatchIdx)
+
+            // 检查是否回到起始批次（避免死循环）
+            if state.currentBatchIdx == startBatchIdx {
+                state.totalExhausted = true
+                return -1, -1, nil, ""
+            }
+        }
+    }
+}
+
+// 标记 Key 为耗尽
+func markKeyAsExhausted(batchIdx, keyIdx int) {
+    state.mu.Lock()
+    defer state.mu.Unlock()
+
+    state.batchAvailable[batchIdx][keyIdx] = false
+    log.Printf("⚠️  Key 已耗尽: 批次 %d, 索引 %d", batchIdx, keyIdx)
+
+    // 检查当前批次是否全部耗尽
+    allExhausted := true
+    for _, avail := range state.batchAvailable[batchIdx] {
+        if avail {
+            allExhausted = false
+            break
+        }
+    }
+
+    if allExhausted {
+        log.Printf("⚠️  批次 %d 全部耗尽", batchIdx)
+    }
 }
 
 func main() {
-    initHTTPClient()
+    // 初始化状态
+    initProxyState()
 
+    // 设置路由
     http.HandleFunc("/", routeHandler)
 
     log.Println("🚀 代理服务器已启动，监听于 http://localhost:" + PROXY_PORT)
@@ -117,12 +291,16 @@ func routeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAnthropicRequest(w http.ResponseWriter, r *http.Request) {
-    bearerToken := extractBearerToken(r)
-    if bearerToken == "" {
-        jsonError(w, "x-api-key or Authorization Bearer token is required", http.StatusUnauthorized)
+    // 选择可用 Key
+    batchIdx, keyIdx, client, factoryKey := selectNextAvailableKey()
+    if client == nil {
+        jsonError(w, "API key pool exhausted", http.StatusNotImplemented) // 501
         return
     }
 
+    log.Printf("[Proxy] 使用批次 %d, Key 索引 %d", batchIdx, keyIdx)
+
+    // 读取并修改请求体
     var bodyBytes []byte
     if r.Body != nil && (r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH") {
         var err error
@@ -146,28 +324,39 @@ func handleAnthropicRequest(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+    // 创建转发请求
     proxyReq, err := http.NewRequest(r.Method, ANTHROPIC_TARGET, bytes.NewReader(bodyBytes))
     if err != nil {
         jsonError(w, "Failed to create proxy request", http.StatusInternalServerError)
         return
     }
 
+    // 复制请求头
     copyHeaders(r, proxyReq)
+
+    // 删除用户的认证头，使用号池 Key
     proxyReq.Header.Del("X-Api-Key")
-    proxyReq.Header.Set("Authorization", "Bearer "+bearerToken)
+    proxyReq.Header.Del("Authorization")
+    proxyReq.Header.Set("Authorization", "Bearer "+factoryKey)
     proxyReq.Header.Set("Host", proxyReq.URL.Host)
 
     log.Printf("[Proxy] 转发 Anthropic 请求到: %s", ANTHROPIC_TARGET)
-    forwardRequest(w, proxyReq)
+
+    // 转发请求
+    forwardRequest(w, proxyReq, client, batchIdx, keyIdx)
 }
 
 func handleOpenAIRequest(w http.ResponseWriter, r *http.Request) {
-    authHeader := r.Header.Get("Authorization")
-    if authHeader == "" {
-        jsonError(w, "Authorization header is required", http.StatusUnauthorized)
+    // 选择可用 Key
+    batchIdx, keyIdx, client, factoryKey := selectNextAvailableKey()
+    if client == nil {
+        jsonError(w, "API key pool exhausted", http.StatusNotImplemented) // 501
         return
     }
 
+    log.Printf("[Proxy] 使用批次 %d, Key 索引 %d", batchIdx, keyIdx)
+
+    // 读取并修改请求体
     var bodyBytes []byte
     if r.Body != nil && (r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH") {
         var err error
@@ -185,6 +374,7 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request) {
                 return
             }
 
+            // OpenAI 特有的处理
             if model, ok := bodyData["model"].(string); ok && model == "gpt-5" {
                 bodyData["model"] = "gpt-5-2025-08-07"
                 log.Println("[Proxy] 模型 gpt-5 已替换为 gpt-5-2025-08-07")
@@ -205,26 +395,38 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+    // 创建转发请求
     proxyReq, err := http.NewRequest(r.Method, OPENAI_TARGET, bytes.NewReader(bodyBytes))
     if err != nil {
         jsonError(w, "Failed to create proxy request", http.StatusInternalServerError)
         return
     }
 
+    // 复制请求头
     copyHeaders(r, proxyReq)
+
+    // 使用号池 Key
+    proxyReq.Header.Del("Authorization")
+    proxyReq.Header.Set("Authorization", "Bearer "+factoryKey)
     proxyReq.Header.Set("Host", proxyReq.URL.Host)
 
     log.Printf("[Proxy] 转发 OpenAI 请求到: %s", OPENAI_TARGET)
-    forwardRequest(w, proxyReq)
+
+    // 转发请求
+    forwardRequest(w, proxyReq, client, batchIdx, keyIdx)
 }
 
 func handleBedrockRequest(w http.ResponseWriter, r *http.Request) {
-    bearerToken := extractBearerToken(r)
-    if bearerToken == "" {
-        jsonError(w, "x-api-key or Authorization Bearer token is required", http.StatusUnauthorized)
+    // 选择可用 Key
+    batchIdx, keyIdx, client, factoryKey := selectNextAvailableKey()
+    if client == nil {
+        jsonError(w, "API key pool exhausted", http.StatusNotImplemented) // 501
         return
     }
 
+    log.Printf("[Proxy] 使用批次 %d, Key 索引 %d", batchIdx, keyIdx)
+
+    // 读取并修改请求体
     var bodyBytes []byte
     if r.Body != nil && (r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH") {
         var err error
@@ -248,31 +450,27 @@ func handleBedrockRequest(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+    // 创建转发请求
     proxyReq, err := http.NewRequest(r.Method, BEDROCK_TARGET, bytes.NewReader(bodyBytes))
     if err != nil {
         jsonError(w, "Failed to create proxy request", http.StatusInternalServerError)
         return
     }
 
+    // 复制请求头
     copyHeaders(r, proxyReq)
+
+    // 使用号池 Key
     proxyReq.Header.Del("X-Api-Key")
-    proxyReq.Header.Set("Authorization", "Bearer "+bearerToken)
+    proxyReq.Header.Del("Authorization")
+    proxyReq.Header.Set("Authorization", "Bearer "+factoryKey)
     proxyReq.Header.Set("X-Model-Provider", "bedrock")
     proxyReq.Header.Set("Host", proxyReq.URL.Host)
 
     log.Printf("[Proxy] 转发 Bedrock 请求到: %s", BEDROCK_TARGET)
-    forwardRequest(w, proxyReq)
-}
 
-func extractBearerToken(r *http.Request) string {
-    if apiKey := r.Header.Get("X-Api-Key"); apiKey != "" {
-        return apiKey
-    }
-    authHeader := r.Header.Get("Authorization")
-    if strings.HasPrefix(authHeader, "Bearer ") {
-        return strings.TrimPrefix(authHeader, "Bearer ")
-    }
-    return ""
+    // 转发请求
+    forwardRequest(w, proxyReq, client, batchIdx, keyIdx)
 }
 
 func processSystemParam(bodyData map[string]interface{}) {
@@ -306,8 +504,8 @@ func copyHeaders(src *http.Request, dst *http.Request) {
     }
 }
 
-func forwardRequest(w http.ResponseWriter, proxyReq *http.Request) {
-    resp, err := httpClient.Do(proxyReq)
+func forwardRequest(w http.ResponseWriter, proxyReq *http.Request, client *http.Client, batchIdx, keyIdx int) {
+    resp, err := client.Do(proxyReq)
     if err != nil {
         log.Printf("[Proxy] 转发请求失败: %v", err)
         jsonError(w, fmt.Sprintf("Bad Gateway: %v", err), http.StatusBadGateway)
@@ -315,14 +513,23 @@ func forwardRequest(w http.ResponseWriter, proxyReq *http.Request) {
     }
     defer resp.Body.Close()
 
+    // 处理 401/402（Key 耗尽）
+    if resp.StatusCode == 401 || resp.StatusCode == 402 {
+        markKeyAsExhausted(batchIdx, keyIdx)
+        log.Printf("[Proxy] Key 耗尽，返回错误给客户端")
+    }
+
+    // 复制响应头
     for key, values := range resp.Header {
         for _, value := range values {
             w.Header().Add(key, value)
         }
     }
 
+    // 设置状态码
     w.WriteHeader(resp.StatusCode)
 
+    // 复制响应体
     if _, err := io.Copy(w, resp.Body); err != nil {
         log.Printf("[Proxy] 复制响应体失败: %v", err)
     }
