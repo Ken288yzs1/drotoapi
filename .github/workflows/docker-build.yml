@@ -67,13 +67,11 @@ jobs:
           docker pull ${{ env.IMAGE_NAME }}:${{ inputs.version }}
           ```
 
-          **运行命令（不使用代理）:**
+          **运行命令:**
           ```bash
-          docker run -d --name drotoapi -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ inputs.version }}
-          ```
-
-          **运行命令（使用 SOCKS5 代理）:**
-          ```bash
-          docker run -d --name drotoapi -p 8000:8000 -e SOCKS5_PROXY=socks5://127.0.0.1:1080 ${{ env.IMAGE_NAME }}:${{ inputs.version }}
+          docker run -d --name drotoapi -p 8000:8000 \
+            -e FACTORY_KEYS=<q>"key1,key2,key3"</q> \
+            -e SOCKS5_PROXY_TEMPLATE=<q>"socks5://user_sid_%s@host:port"</q> \
+            ${{ env.IMAGE_NAME }}:${{ inputs.version }}
           ```
           EOF
