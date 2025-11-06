@@ -27,6 +27,12 @@ var (
     SOCKS5_PROXY_TEMPLATE = getEnv("SOCKS5_PROXY_TEMPLATE", "")
 )
 
+// 全局 SID 池
+var (
+    sidPool  []string
+    sidMutex sync.Mutex
+)
+
 // 全局状态
 type ProxyState struct {
     batches         [][]string       // Key 分批
@@ -47,10 +53,41 @@ func getEnv(key, defaultValue string) string {
     return defaultValue
 }
 
-// 生成随机 8 位 sid
-func generateRandomSID() string {
-    rand.Seed(time.Now().UnixNano())
-    return fmt.Sprintf("%08d", rand.Intn(90000000)+10000000)
+// 初始化 SID 池（保证唯一性）
+func initSIDPool(size int) {
+    log.Printf("🔢 开始生成 %d 个唯一的 SID...", size)
+
+    sidPool = make([]string, size)
+    usedSIDs := make(map[string]bool)
+
+    for i := 0; i < size; i++ {
+        for {
+            // 生成随机 8 位数字
+            sid := fmt.Sprintf("%08d", rand.Intn(90000000)+10000000)
+
+            // 检查是否重复
+            if !usedSIDs[sid] {
+                sidPool[i] = sid
+                usedSIDs[sid] = true
+                break
+            }
+        }
+    }
+
+    log.Printf("✅ 成功生成 %d 个唯一的 SID", size)
+}
+
+// 从池中获取 SID
+func getSIDFromPool(index int) string {
+    sidMutex.Lock()
+    defer sidMutex.Unlock()
+
+    if index < 0 || index >= len(sidPool) {
+        log.Printf("⚠️  警告: SID 索引越界: %d", index)
+        return fmt.Sprintf("%08d", rand.Intn(90000000)+10000000)
+    }
+
+    return sidPool[index]
 }
 
 // 初始化 ProxyState
@@ -75,6 +112,9 @@ func initProxyState() {
 
     log.Printf("📊 加载了 %d 个 Factory Keys", len(keys))
 
+    // 初始化 SID 池（生成唯一的 SID）
+    initSIDPool(len(keys))
+
     // 分批（每批 5 个）
     batchSize := 5
     batches := [][]string{}
@@ -92,6 +132,8 @@ func initProxyState() {
     batchClients := make([][]*http.Client, len(batches))
     batchAvailable := make([][]bool, len(batches))
 
+    sidIndex := 0 // 全局 SID 索引
+
     for batchIdx, batch := range batches {
         log.Printf("📦 批次 %d: %d 个 Keys", batchIdx, len(batch))
 
@@ -99,8 +141,9 @@ func initProxyState() {
         available := make([]bool, len(batch))
 
         for keyIdx := range batch {
-            // 生成随机 sid
-            sid := generateRandomSID()
+            // 从 SID 池获取唯一的 SID
+            sid := getSIDFromPool(sidIndex)
+            sidIndex++
 
             // 构建代理 URL
             proxyURL := strings.Replace(SOCKS5_PROXY_TEMPLATE, "%s", sid, 1)
@@ -258,6 +301,9 @@ func markKeyAsExhausted(batchIdx, keyIdx int) {
 }
 
 func main() {
+    // 初始化随机数生成器（只执行一次）
+    rand.Seed(time.Now().UnixNano())
+
     // 初始化状态
     initProxyState()
 
